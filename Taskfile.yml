@@ -1,0 +1,20 @@
+version: '3'
+
+tasks:
+  checkpoint:
+    dir: scripts
+    cmds:
+      - npx zx checkpoint.mjs
+
+  train:
+    deps: [checkpoint]
+    dir: mainrun
+    cmds:
+      - python3 train.py
+
+  submit:
+    deps: [checkpoint]
+    dir: scripts
+    cmds:
+      - npx zx submit.mjs
+    

@@ -14,15 +14,15 @@ import structlog
 
 @dataclass
 class Hyperparameters:
-    block_size: int = 64 #128
-    batch_size: int = 32 #64
+    block_size: int = 64 #128 -> 64 for efficient memory usage
+    batch_size: int = 32 #64 -> 32 for efficient memory usage
     vocab_size: int = 16_000
-    n_layer: int = 6
-    n_head: int = 8
-    d_model: int = 512
+    n_layer: int = 6 #8
+    n_head: int = 8 #12
+    d_model: int = 512 #768
     dropout: float = 0.1
-    lr: float = 6e-3
-    weight_decay: float = 0.0
+    lr: float = 1e-4 #6e-3 # 1e-4 to 1e2
+    weight_decay: float = 1e-3 #0.0 #1e-4 to 1e-2
     evals_per_epoch: int = 3
     
     epochs: int = 7
@@ -262,7 +262,8 @@ def main():
     model_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.log("model_info", parameters_count=model_params)
     
-    opt = torch.optim.SGD(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
+                            weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max_steps)
 
     def evaluate():

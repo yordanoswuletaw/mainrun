@@ -25,7 +25,7 @@ class Hyperparameters:
     d_model: int = 512  # 512
     dropout: float = 0.0 # 0.1
     lr: float = 1e-4  # 6e-3 # 1e-4 to 1e2
-    weight_decay: float = 1e-3  # 0.0 #1e-4 to 1e-2
+    weight_decay: float = 1e-2  # 0.0 #1e-4 to 1e-2
     evals_per_epoch: int = 3
 
     epochs: int = 7
@@ -299,8 +299,8 @@ def main():
     # Switched to cosine annealing with warmup
     # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max_steps)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        opt, max_lr=5e-4, total_steps=max_steps,
-        pct_start=0.15, anneal_strategy='cos'
+        opt, max_lr=6e-4, total_steps=max_steps,
+        pct_start=0.2, anneal_strategy='cos'
     )
 
     def evaluate():

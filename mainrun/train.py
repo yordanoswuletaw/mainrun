@@ -299,8 +299,8 @@ def main():
     # Switched to cosine annealing with warmup
     # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max_steps)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        opt, max_lr=5e-4, total_steps=max_steps,
-        pct_start=0.5, anneal_strategy='cos', div_factor=5.0
+        opt, max_lr=3e-4, total_steps=max_steps,
+        pct_start=0.1, anneal_strategy='cos'
     )
 
     def evaluate():

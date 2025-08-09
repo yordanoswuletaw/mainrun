@@ -17,15 +17,16 @@ import structlog
 
 @dataclass
 class Hyperparameters:
-    block_size: int = 64  # old value: 128 for efficient memory usage
+    block_size: int = 64  # Consider increasing to 128 for better context
     batch_size: int = 64
-    vocab_size: int = 16_000
-    n_layer: int = 6 
-    n_head: int = 8  
-    d_model: int = 512  
-    dropout: float = 0.05 # old value: 0.1
-    lr: float = 1e-4  # old value: 6e-3 
-    weight_decay: float = 1e-2  # old value: 0.0 
+    vocab_size: int = 16_000  # Consider increasing to 32_000
+    n_layer: int = 6
+    n_head: int = 8
+    d_model: int = 512
+    dropout: float = 0.05  # Optimal from analysis
+    lr: float = 1e-4
+    weight_decay: float = 1e-2  # Optimal from analysis
+    betas: tuple = (0.9, 0.95)  # More aggressive than default
     evals_per_epoch: int = 3
 
     epochs: int = 7
@@ -151,53 +152,71 @@ class GPTConfig:
     dropout: float
 
 
+class RMSNorm(nn.Module):
+    """RMSNorm is more efficient than LayerNorm"""
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        norm = x.pow(2).mean(-1, keepdim=True).add(self.eps).sqrt()
+        return self.weight * x / norm
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
         assert cfg.d_model % cfg.n_head == 0
         self.head_dim = cfg.d_model // cfg.n_head
         self.n_head = cfg.n_head
+        self.dropout_p = cfg.dropout
+
         self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model)
         self.proj = nn.Linear(cfg.d_model, cfg.d_model)
-        self.attn_drop = nn.Dropout(cfg.dropout)
         self.resid_drop = nn.Dropout(cfg.dropout)
-        self.register_buffer("tril", torch.tril(
-            torch.ones(cfg.block_size, cfg.block_size)))
 
     def forward(self, x: torch.Tensor):
         B, T, C = x.size()
         qkv = self.qkv(x).view(B, T, 3, self.n_head,
                                self.head_dim).transpose(1, 3)
         q, k, v = qkv[..., 0, :, :], qkv[..., 1, :, :], qkv[..., 2, :, :]
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
-        att = F.softmax(att, dim=-1)
-        att = self.attn_drop(att)
-        y = att @ v
+
+        # Use scaled dot-product attention (more efficient and stable)
+        y = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=self.dropout_p if self.training else 0.0,
+            is_causal=True
+        )
+
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.resid_drop(self.proj(y))
 
 
-class MLP(nn.Module):
+class SwiGLUMLP(nn.Module):
+    """SwiGLU activation function - shown to improve performance"""
+
     def __init__(self, cfg: GPTConfig):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(cfg.d_model, 4 * cfg.d_model),
-            nn.GELU(),
-            nn.Linear(4 * cfg.d_model, cfg.d_model),
-            nn.Dropout(cfg.dropout),
-        )
+        hidden_dim = int(8/3 * cfg.d_model)  # SwiGLU specific ratio
+        self.w1 = nn.Linear(cfg.d_model, hidden_dim, bias=False)
+        self.w2 = nn.Linear(cfg.d_model, hidden_dim, bias=False)
+        self.w3 = nn.Linear(hidden_dim, cfg.d_model, bias=False)
+        self.dropout = nn.Dropout(cfg.dropout)
 
-    def forward(self, x): return self.net(x)
+    def forward(self, x):
+        return self.dropout(self.w3(F.silu(self.w1(x)) * self.w2(x)))
 
 
 class Block(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
-        self.ln1 = nn.LayerNorm(cfg.d_model)
-        self.ln2 = nn.LayerNorm(cfg.d_model)
+        self.ln1 = RMSNorm(cfg.d_model)
+        self.ln2 = RMSNorm(cfg.d_model)
         self.attn = CausalSelfAttention(cfg)
-        self.mlp = MLP(cfg)
+        self.mlp = SwiGLUMLP(cfg)
 
     def forward(self, x):
         x = x + self.attn(self.ln1(x))
@@ -214,10 +233,11 @@ class GPT(nn.Module):
             torch.zeros(1, cfg.block_size, cfg.d_model))
         self.drop = nn.Dropout(cfg.dropout)
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)])
-        self.ln_f = nn.LayerNorm(cfg.d_model)
+        self.ln_f = RMSNorm(cfg.d_model)
         self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
 
         self.apply(self._init_weights)
+        # Tie embeddings
         self.head.weight = self.token_emb.weight
 
     @staticmethod
@@ -242,6 +262,59 @@ class GPT(nn.Module):
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), targets.view(-1), reduction='mean')
         return logits, loss
+
+
+def configure_optimizers(model, weight_decay, learning_rate, betas):
+    """Configure optimizer with parameter groups for weight decay"""
+    decay_params = []
+    no_decay_params = []
+
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            if param.ndim == 1 or name.endswith('.bias') or 'norm' in name:
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+
+    optim_groups = [
+        {'params': decay_params, 'weight_decay': weight_decay},
+        {'params': no_decay_params, 'weight_decay': 0.0}
+    ]
+
+    optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas)
+    return optimizer
+
+
+class EMA:
+    """Exponential Moving Average of model parameters"""
+
+    def __init__(self, model, decay=0.999):
+        self.model = model
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+
+    @torch.no_grad()
+    def update(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name].mul_(self.decay).add_(
+                    param.data, alpha=1 - self.decay)
+
+    def apply_shadow(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.backup[name] = param.data.clone()
+                param.data = self.shadow[name]
+
+    def restore(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                param.data = self.backup[name]
 
 
 def main():
@@ -292,28 +365,37 @@ def main():
                        for p in model.parameters() if p.requires_grad)
     logger.log("model_info", parameters_count=model_params)
 
-    # Switched to AdamW with weight decay
-    # opt = torch.optim.SGD(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
-                            weight_decay=args.weight_decay)
-    # Switched to cosine annealing with warmup
-    # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max_steps)
+    # Configure optimizer with parameter groups
+    opt = configure_optimizers(model, args.weight_decay, args.lr, args.betas)
+
+    # Fixed OneCycleLR configuration
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        opt, max_lr=5e-4, total_steps=max_steps,
-        pct_start=0.2, anneal_strategy='cos',
-        div_factor=5.0, final_div_factor=100.0
+        opt,
+        max_lr=5e-4,  # Reasonable max LR (5x base LR)
+        total_steps=max_steps,
+        pct_start=0.2,  # 20% warmup
+        anneal_strategy='cos',
+        div_factor=5.0,  # Start at max_lr/5
+        final_div_factor=100.0  # End at max_lr/500
     )
+
+    # Initialize EMA
+    ema = EMA(model, decay=0.999)
 
     def evaluate():
         model.eval()
         losses = 0.0
         with torch.no_grad():
+            # Apply EMA weights for evaluation
+            ema.apply_shadow()
             for xb, yb in iter_full_split(val_ids, args.block_size, args.batch_size, device):
                 logits, _ = model(xb, yb)
                 B, T, V = logits.size()
                 loss = F.cross_entropy(
                     logits.view(-1, V), yb.view(-1), reduction='sum')
                 losses += loss.item()
+            # Restore original weights
+            ema.restore()
         model.train()
         return losses / len(val_text)
 
@@ -331,6 +413,7 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             scheduler.step()
+            ema.update()  # Update EMA after each step
 
             elapsed = time.time() - t0
             logger.log("training_step",

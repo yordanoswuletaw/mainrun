@@ -181,14 +181,26 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(cfg.d_model, 4 * cfg.d_model),
-            nn.GELU(),
-            nn.Linear(4 * cfg.d_model, cfg.d_model),
-            nn.Dropout(cfg.dropout),
-        )
+        # self.net = nn.Sequential(
+        #     nn.Linear(cfg.d_model, 4 * cfg.d_model),
+        #     nn.GELU(),
+        #     nn.Linear(4 * cfg.d_model, cfg.d_model),
+        #     nn.Dropout(cfg.dropout),
+        # )
+        # SwiGLU implementation: SwiGLU(x) = SwiGLU(W1*x) ⊙ W2*x
+        # where SwiGLU(x) = x * sigmoid(βx) and ⊙ is element-wise multiplication
+        # SwiGLU specific ratio (vs 4x for standard MLP)
+        hidden_dim = int(8/3 * cfg.d_model)  # SwiGLU specific ratio
+        self.w1 = nn.Linear(cfg.d_model, hidden_dim, bias=False)
+        self.w2 = nn.Linear(cfg.d_model, hidden_dim, bias=False)
+        self.w3 = nn.Linear(hidden_dim, cfg.d_model, bias=False)
+        self.dropout = nn.Dropout(cfg.dropout)
 
-    def forward(self, x): return self.net(x)
+    # def forward(self, x): return self.net(x)
+
+    def forward(self, x):
+        # SwiGLU: SwiGLU(W1*x) ⊙ W2*x
+        return self.dropout(self.w3(F.silu(self.w1(x)) * self.w2(x)))
 
 
 class Block(nn.Module):
@@ -243,29 +255,6 @@ class GPT(nn.Module):
                 logits.view(-1, logits.size(-1)), targets.view(-1), reduction='mean')
         return logits, loss
 
-# This is a custom optimizer that allows for parameter-grouped weight decay
-
-
-def configure_optimizers(model, weight_decay, learning_rate, betas=(0.9, 0.95)):
-    """Configure optimizer with parameter groups for weight decay"""
-    decay_params = []
-    no_decay_params = []
-
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            if param.ndim == 1 or name.endswith('.bias') or 'ln' in name:
-                no_decay_params.append(param)
-            else:
-                decay_params.append(param)
-
-    optim_groups = [
-        {'params': decay_params, 'weight_decay': weight_decay},
-        {'params': no_decay_params, 'weight_decay': 0.0}
-    ]
-
-    optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas)
-    return optimizer
-
 
 def main():
     args = Hyperparameters()
@@ -317,12 +306,8 @@ def main():
 
     # Switched to AdamW with weight decay
     # opt = torch.optim.SGD(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    # opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
-    #                         weight_decay=args.weight_decay)
-
-    # Configure optimizer with parameter groups for weight decay
-    opt = configure_optimizers(
-        model, args.weight_decay, args.lr, betas=(0.9, 0.95))
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
+                            weight_decay=args.weight_decay)
     # Switched to cosine annealing with warmup
     # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max_steps)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(

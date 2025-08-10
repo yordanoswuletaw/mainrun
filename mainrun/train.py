@@ -20,12 +20,12 @@ class Hyperparameters:
     block_size: int = 64  # old value: 128 for efficient memory usage
     batch_size: int = 64
     vocab_size: int = 16_000
-    n_layer: int = 6 
-    n_head: int = 8  
-    d_model: int = 512  
-    dropout: float = 0.05 # old value: 0.1
-    lr: float = 1e-4  # old value: 6e-3 
-    weight_decay: float = 1e-2  # old value: 0.0 
+    n_layer: int = 6
+    n_head: int = 8
+    d_model: int = 512
+    dropout: float = 0.05  # old value: 0.1
+    lr: float = 1e-4  # old value: 6e-3
+    weight_decay: float = 1e-2  # old value: 0.0
     evals_per_epoch: int = 3
 
     epochs: int = 7
@@ -159,49 +159,88 @@ class CausalSelfAttention(nn.Module):
         self.n_head = cfg.n_head
         self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model)
         self.proj = nn.Linear(cfg.d_model, cfg.d_model)
-        self.attn_drop = nn.Dropout(cfg.dropout)
+        # self.attn_drop = nn.Dropout(cfg.dropout)
+        self.dropout_p = cfg.dropout
         self.resid_drop = nn.Dropout(cfg.dropout)
-        self.register_buffer("tril", torch.tril(
-            torch.ones(cfg.block_size, cfg.block_size)))
+        # self.register_buffer("tril", torch.tril(
+        #     torch.ones(cfg.block_size, cfg.block_size)))
 
     def forward(self, x: torch.Tensor):
         B, T, C = x.size()
         qkv = self.qkv(x).view(B, T, 3, self.n_head,
                                self.head_dim).transpose(1, 3)
         q, k, v = qkv[..., 0, :, :], qkv[..., 1, :, :], qkv[..., 2, :, :]
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
-        att = F.softmax(att, dim=-1)
-        att = self.attn_drop(att)
-        y = att @ v
+
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
+        # att = F.softmax(att, dim=-1)
+        # att = self.attn_drop(att)
+        # y = att @ v
+
+        # Use PyTorch's optimized Scaled Dot-Product Attention
+        y = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=self.dropout_p if self.training else 0.0,
+            is_causal=True
+        )
+
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.resid_drop(self.proj(y))
+
+
+class RMSNorm(nn.Module):
+    """RMSNorm: Root Mean Square Layer Normalization"""
+
+    def __init__(self, hidden_size, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states):
+        variance = hidden_states.var(-1, keepdim=True, unbiased=False)
+        return self.weight * hidden_states * torch.rsqrt(variance + self.variance_epsilon)
 
 
 class MLP(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(cfg.d_model, 4 * cfg.d_model),
-            nn.GELU(),
-            nn.Linear(4 * cfg.d_model, cfg.d_model),
-            nn.Dropout(cfg.dropout),
-        )
+        # self.net = nn.Sequential(
+        #     nn.Linear(cfg.d_model, 4 * cfg.d_model),
+        #     nn.GELU(),
+        #     nn.Linear(4 * cfg.d_model, cfg.d_model),
+        #     nn.Dropout(cfg.dropout),
+        # )
+        # SwiGLU implementation: SwiGLU(x) = SwiGLU(W1*x) ⊙ W2*x
+        # where SwiGLU(x) = x * sigmoid(βx) and ⊙ is element-wise multiplication
+        # SwiGLU specific ratio (vs 4x for standard MLP)
+        hidden_dim = int(8/3 * cfg.d_model)
+        self.w1 = nn.Linear(cfg.d_model, hidden_dim, bias=False)
+        self.w2 = nn.Linear(cfg.d_model, hidden_dim, bias=False)
+        self.w3 = nn.Linear(hidden_dim, cfg.d_model, bias=False)
+        self.dropout = nn.Dropout(cfg.dropout)
 
-    def forward(self, x): return self.net(x)
+    # def forward(self, x): return self.net(x)
+    def forward(self, x):
+        # SwiGLU: SwiGLU(W1*x) ⊙ W2*x
+        return self.dropout(self.w3(F.silu(self.w1(x)) * self.w2(x)))
 
 
 class Block(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
-        self.ln1 = nn.LayerNorm(cfg.d_model)
-        self.ln2 = nn.LayerNorm(cfg.d_model)
+        # self.ln1 = nn.LayerNorm(cfg.d_model)
+        # self.ln2 = nn.LayerNorm(cfg.d_model)
+        self.rms1 = RMSNorm(cfg.d_model)
+        self.rms2 = RMSNorm(cfg.d_model)
         self.attn = CausalSelfAttention(cfg)
         self.mlp = MLP(cfg)
 
     def forward(self, x):
-        x = x + self.attn(self.ln1(x))
-        x = x + self.mlp(self.ln2(x))
+        # x = x + self.attn(self.ln1(x))
+        # x = x + self.mlp(self.ln2(x))
+        x = x + self.attn(self.rms1(x))
+        x = x + self.mlp(self.rms2(x))
         return x
 
 
@@ -214,7 +253,8 @@ class GPT(nn.Module):
             torch.zeros(1, cfg.block_size, cfg.d_model))
         self.drop = nn.Dropout(cfg.dropout)
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)])
-        self.ln_f = nn.LayerNorm(cfg.d_model)
+        #  self.ln_f = nn.LayerNorm(cfg.d_model)
+        self.rms_f = RMSNorm(cfg.d_model)
         self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
 
         self.apply(self._init_weights)
@@ -234,7 +274,8 @@ class GPT(nn.Module):
         x = self.drop(tok + pos)
         for block in self.blocks:
             x = block(x)
-        x = self.ln_f(x)
+        #  x = self.ln_f(x)
+        x = self.rms_f(x)
         logits = self.head(x)
         if targets is None:
             loss = None
@@ -242,6 +283,30 @@ class GPT(nn.Module):
             loss = F.cross_entropy(
                 logits.view(-1, logits.size(-1)), targets.view(-1), reduction='mean')
         return logits, loss
+
+# This is a custom optimizer that allows for parameter-grouped weight decay
+
+
+def configure_optimizers(model, weight_decay, learning_rate, betas=(0.9, 0.95)):
+    """Configure optimizer with parameter groups for weight decay"""
+    decay_params = []
+    no_decay_params = []
+
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            # if param.ndim == 1 or name.endswith('.bias') or 'ln' in name:
+            if param.ndim == 1 or name.endswith('.bias') or 'ln' in name or 'rms' in name:
+                no_decay_params.append(param)
+            else:
+                decay_params.append(param)
+
+    optim_groups = [
+        {'params': decay_params, 'weight_decay': weight_decay},
+        {'params': no_decay_params, 'weight_decay': 0.0}
+    ]
+
+    optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas)
+    return optimizer
 
 
 def main():
@@ -294,8 +359,12 @@ def main():
 
     # Switched to AdamW with weight decay
     # opt = torch.optim.SGD(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
-                            weight_decay=args.weight_decay)
+    # opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
+    #                         weight_decay=args.weight_decay)
+
+    # Configure optimizer with parameter groups for weight decay
+    opt = configure_optimizers(
+        model, args.weight_decay, args.lr, betas=(0.9, 0.95))
     # Switched to cosine annealing with warmup
     # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max_steps)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(

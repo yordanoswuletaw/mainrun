@@ -151,6 +151,26 @@ class GPTConfig:
     dropout: float
 
 
+class RMSNorm(nn.Module):
+    """RMSNorm: Root Mean Square Layer Normalization.
+
+    RMSNorm is a simplified version of LayerNorm that only normalizes by the 
+    root mean square of the input, without the learnable affine transformation.
+    This makes it more efficient and stable during training.
+    """
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Calculate RMS: sqrt(mean(x^2))
+        rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        # Normalize and scale
+        return x * rms * self.weight
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
@@ -159,36 +179,21 @@ class CausalSelfAttention(nn.Module):
         self.n_head = cfg.n_head
         self.qkv = nn.Linear(cfg.d_model, 3 * cfg.d_model)
         self.proj = nn.Linear(cfg.d_model, cfg.d_model)
-        #  self.attn_drop = nn.Dropout(cfg.dropout)
-        self.dropout_p = cfg.dropout
+        self.attn_drop = nn.Dropout(cfg.dropout)
         self.resid_drop = nn.Dropout(cfg.dropout)
-        # self.register_buffer("tril", torch.tril(
-        #     torch.ones(cfg.block_size, cfg.block_size)))
+        self.register_buffer("tril", torch.tril(
+            torch.ones(cfg.block_size, cfg.block_size)))
 
     def forward(self, x: torch.Tensor):
         B, T, C = x.size()
         qkv = self.qkv(x).view(B, T, 3, self.n_head,
                                self.head_dim).transpose(1, 3)
         q, k, v = qkv[..., 0, :, :], qkv[..., 1, :, :], qkv[..., 2, :, :]
-        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        # att = att.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
-        # att = F.softmax(att, dim=-1)
-        # att = self.attn_drop(att)
-        # y = att @ v
-        # Use PyTorch's optimized Scaled Dot-Product Attention
-        # scale: explicitly set to 1/sqrt(head_dim) for consistency
-        # dropout_p: 0.0 during evaluation, self.dropout_p during training
-        # is_causal: True for causal language modeling
-        y = F.scaled_dot_product_attention(
-            query=q,
-            key=k,
-            value=v,
-            attn_mask=None,  # No additional mask needed when is_causal=True
-            dropout_p=self.dropout_p if self.training else 0.0,
-            is_causal=True,  # This handles causal masking automatically
-            scale=1.0 / math.sqrt(self.head_dim)  # Explicit scale factor
-        )
-
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att = att.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
+        att = F.softmax(att, dim=-1)
+        att = self.attn_drop(att)
+        y = att @ v
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.resid_drop(self.proj(y))
 
@@ -221,8 +226,10 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, cfg: GPTConfig):
         super().__init__()
-        self.ln1 = nn.LayerNorm(cfg.d_model)
-        self.ln2 = nn.LayerNorm(cfg.d_model)
+        # self.ln1 = nn.LayerNorm(cfg.d_model)
+        # self.ln2 = nn.LayerNorm(cfg.d_model)
+        self.ln1 = RMSNorm(cfg.d_model)
+        self.ln2 = RMSNorm(cfg.d_model)
         self.attn = CausalSelfAttention(cfg)
         self.mlp = MLP(cfg)
 
@@ -241,7 +248,8 @@ class GPT(nn.Module):
             torch.zeros(1, cfg.block_size, cfg.d_model))
         self.drop = nn.Dropout(cfg.dropout)
         self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)])
-        self.ln_f = nn.LayerNorm(cfg.d_model)
+        # self.ln_f = nn.LayerNorm(cfg.d_model)
+        self.ln_f = RMSNorm(cfg.d_model)
         self.head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
 
         self.apply(self._init_weights)
